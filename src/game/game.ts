@@ -11,6 +11,10 @@
  */
 
 import * as THREE from "three";
+import { EffectComposer } from "three/addons/postprocessing/EffectComposer.js";
+import { RenderPass } from "three/addons/postprocessing/RenderPass.js";
+import { UnrealBloomPass } from "three/addons/postprocessing/UnrealBloomPass.js";
+import { OutputPass } from "three/addons/postprocessing/OutputPass.js";
 import { GameLoop } from "./engine";
 import { Input } from "./input";
 import { GameStateMachine } from "./state";
@@ -19,6 +23,7 @@ import { Duelist } from "./rig";
 import { buildArena, type ArenaHandle } from "./arena";
 import { Sparks, Trail } from "./fx";
 import { EnemyAI, type AIEvents } from "./ai";
+import { Ragdoll, warmupRapier, whenRapierReady } from "./ragdoll";
 import { bridge } from "./bridge";
 import { storage } from "./storage";
 import { ERAS, TUNE, type EraId } from "./config";
@@ -62,6 +67,8 @@ function distPointSeg(
 
 export class BladeDuelGame implements AIEvents {
   private renderer: THREE.WebGLRenderer;
+  private composer: EffectComposer;
+  private bloom: UnrealBloomPass;
   private scene = new THREE.Scene();
   private camera: THREE.PerspectiveCamera;
   private loop: GameLoop;
@@ -121,6 +128,7 @@ export class BladeDuelGame implements AIEvents {
   private lowFpsTime = 0;
   private degraded = false;
   private tGlobal = 0;
+  private ragdoll: Ragdoll | null = null;
 
   private unsub: Array<() => void> = [];
 
@@ -130,8 +138,19 @@ export class BladeDuelGame implements AIEvents {
     this.renderer.setSize(window.innerWidth, window.innerHeight, false);
     this.renderer.shadowMap.enabled = true;
     this.renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+    this.renderer.toneMapping = THREE.ACESFilmicToneMapping;
+    this.renderer.toneMappingExposure = 1.12;
 
     this.camera = new THREE.PerspectiveCamera(55, window.innerWidth / window.innerHeight, 0.05, 120);
+
+    // cinematic post: bloom picks up emissive blades, braziers, neon and the parry glint
+    this.composer = new EffectComposer(this.renderer);
+    this.composer.addPass(new RenderPass(this.scene, this.camera));
+    this.bloom = new UnrealBloomPass(new THREE.Vector2(window.innerWidth, window.innerHeight), 0.55, 0.5, 0.8);
+    this.composer.addPass(this.bloom);
+    this.composer.addPass(new OutputPass());
+
+    warmupRapier(); // physics WASM loads ahead of the first knock-out
     this.scene.add(this.sparks.points, this.trailP.mesh, this.trailE.mesh);
 
     this.marker = new THREE.Mesh(
@@ -171,6 +190,11 @@ export class BladeDuelGame implements AIEvents {
 
   private buildWorld(): void {
     const era = ERAS[this.era];
+
+    if (this.ragdoll) {
+      this.ragdoll.dispose();
+      this.ragdoll = null;
+    }
 
     // lights
     if (!this.hemi) {
@@ -341,6 +365,7 @@ export class BladeDuelGame implements AIEvents {
   private toTitle(): void {
     if (this.sm.is("playing")) this.sm.transition("title");
     else if (this.sm.is("paused") || this.sm.is("gameover")) this.sm.transition("title");
+    this.buildWorld(); // restores the loser rig if a ragdoll replaced it
     this.audio.stopMusic();
     this.audio.setTension(0);
     this.marker.visible = false;
@@ -354,6 +379,7 @@ export class BladeDuelGame implements AIEvents {
 
   private gameOver(win: boolean): void {
     this.sm.transition("gameover");
+    this.spawnRagdoll(win);
     this.stats.timeSec = Math.round(this.duelTime);
     const rec = this.records[this.era];
     if (win) {
@@ -373,6 +399,43 @@ export class BladeDuelGame implements AIEvents {
   private flash(kind: FlashKind): void {
     this.flashId++;
     bridge.set({ flash: { id: this.flashId, text: FLASH_TEXT[kind], kind } });
+  }
+
+  /** the loser goes ragdoll: hide the procedural rig, drop jointed bodies with a kill impulse */
+  private spawnRagdoll(win: boolean): void {
+    const loser = win ? this.enemy : this.player;
+    const loserPos = win ? this.enemyPos : this.playerPos;
+    const winnerPos = win ? this.playerPos : this.enemyPos;
+    if (!loser) return;
+    this.marker.visible = false;
+    const dir = _v1.subVectors(loserPos, winnerPos);
+    dir.y = 0;
+    if (dir.lengthSq() < 1e-6) dir.set(0, 0, win ? -1 : 1);
+    dir.normalize();
+    const impulse = new THREE.Vector3(dir.x * 2.6, 2.2, dir.z * 2.6);
+    const palette = win ? ENEMY_PALETTE : PLAYER_PALETTE;
+    const blade = ERAS[this.era].blade;
+    const origin = new THREE.Vector3(loserPos.x, 0, loserPos.z);
+    const spawn = () => {
+      if (!this.sm.is("gameover") || this.ragdoll) return;
+      loser.group.visible = false;
+      this.ragdoll = new Ragdoll(
+        origin,
+        this.floorY,
+        impulse,
+        palette,
+        blade.color,
+        blade.emissiveIntensity > 0 ? blade.emissive : 0,
+      );
+      this.scene.add(this.ragdoll.group);
+    };
+    // Rapier's WASM almost always finished loading long before the first knock-out;
+    // if it somehow has not, fall back to simply toppling the rig over
+    whenRapierReady().then(spawn).catch(() => {
+      if (!this.sm.is("gameover")) return;
+      loser.group.rotation.x = (win ? -1 : 1) * Math.PI * 0.45;
+      loser.group.position.y = this.floorY + 0.12;
+    });
   }
 
   /* ------------------------------ AIEvents ------------------------------ */
@@ -415,6 +478,7 @@ export class BladeDuelGame implements AIEvents {
       this.audio.sfx("thud");
       this.hitstop = 0.08;
       this.shake = 0.55;
+      this.playerPos.z += 0.18; // the strike shoves the player back
       const s = bridge.getSnapshot();
       bridge.set({ hurtPulse: s.hurtPulse + 1, hpP: this.hpP });
       if (this.hpP <= 0) this.gameOver(false);
@@ -448,6 +512,14 @@ export class BladeDuelGame implements AIEvents {
     if (this.sm.is("title")) {
       this.titleOrbit += rawDt * 0.12;
       this.idleScene(dt);
+      return;
+    }
+    if (this.sm.is("gameover")) {
+      // the duel is decided: physics keeps playing out behind the result screen
+      this.ragdoll?.update(rawDt);
+      this.player?.update(rawDt, this.tGlobal, 0);
+      this.enemy?.update(rawDt, this.tGlobal, 0);
+      this.shake = Math.max(0, this.shake - rawDt * 2.2);
       return;
     }
     if (!this.sm.is("playing")) return;
@@ -670,6 +742,7 @@ export class BladeDuelGame implements AIEvents {
       this.hitCooldown = TUNE.HIT_COOLDOWN;
       this.hitstop = 0.07;
       this.shake = Math.max(this.shake, 0.3);
+      this.enemyPos.z -= 0.14; // knockback away from the player
       this.flash(riposte ? "riposte" : "hit");
       if (this.hpE <= 0) this.gameOver(true);
     }
@@ -728,7 +801,7 @@ export class BladeDuelGame implements AIEvents {
     }
     this.sparks.update(1 / 60);
 
-    this.renderer.render(this.scene, this.camera);
+    this.composer.render();
     window.__GAME_READY__ = true;
   }
 
@@ -758,6 +831,7 @@ export class BladeDuelGame implements AIEvents {
     this.camera.aspect = window.innerWidth / window.innerHeight;
     this.camera.updateProjectionMatrix();
     this.renderer.setSize(window.innerWidth, window.innerHeight, false);
+    this.composer.setSize(window.innerWidth, window.innerHeight);
   };
 
   dispose(): void {
@@ -770,11 +844,13 @@ export class BladeDuelGame implements AIEvents {
     this.player?.dispose();
     this.enemy?.dispose();
     this.arena?.dispose();
+    this.ragdoll?.dispose();
     this.sparks.dispose();
     this.trailP.dispose();
     this.trailE.dispose();
     this.marker.geometry.dispose();
     (this.marker.material as THREE.Material).dispose();
+    this.composer.dispose();
     this.renderer.dispose();
     bridge.detach();
   }

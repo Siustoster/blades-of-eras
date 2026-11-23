@@ -1,14 +1,36 @@
 {
-  "name": "game-3d-app",
+  "name": "blades-of-eras",
   "private": true,
-  "version": "0.0.0",
+  "version": "1.0.0",
   "type": "module",
+  "main": "electron/main.cjs",
   "scripts": {
     "dev": "vite",
     "build": "tsc -b && vite build",
     "check": "tsc -b",
     "preview": "vite preview",
-    "verify": "node scripts/verify-game.mjs"
+    "verify": "node scripts/verify-game.mjs",
+    "desktop": "electron .",
+    "dist:win": "npm run build && node scripts/pack-manual.cjs"
+  },
+  "build": {
+    "appId": "com.siustoster.blades-of-eras",
+    "productName": "Blades of Eras",
+    "files": [
+      "dist/**/*",
+      "electron/**/*"
+    ],
+    "directories": {
+      "output": "release"
+    },
+    "win": {
+      "target": [
+        "portable"
+      ]
+    },
+    "portable": {
+      "artifactName": "blades-of-eras.exe"
+    }
   },
   "dependencies": {
     "@dimforge/rapier3d-compat": "^0.17.3",
@@ -26,6 +48,8 @@
     "@types/react-dom": "^19.2.2",
     "@types/three": "^0.180.0",
     "@vitejs/plugin-react": "^5.1.0",
+    "electron": "^45.4.1",
+    "electron-builder": "^26.18.0",
     "playwright": "^1.56.1",
     "typescript": "^5.9.3",
     "vite": "^7.2.2",

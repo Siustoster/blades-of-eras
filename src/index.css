@@ -237,6 +237,12 @@ html, body, #root {
   padding: 24px;
 }
 
+/* the result screen doubles as a stage for the ragdoll — keep the scene visible */
+.menu:has(.stats) {
+  background: rgba(6, 8, 12, 0.35);
+  backdrop-filter: blur(1.5px);
+}
+
 .game-title {
   margin: 0;
   font-size: 64px;
